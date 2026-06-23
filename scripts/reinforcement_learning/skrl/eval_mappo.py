@@ -25,6 +25,8 @@ parser.add_argument("--camera_eye", type=float, nargs=3, default=None, help="Cam
 parser.add_argument("--camera_lookat", type=float, nargs=3, default=None, help="Camera lookat position (x y z).")
 parser.add_argument("--video_dir", type=str, default=None, help="Override video output directory.")
 parser.add_argument("--no_motion_blur", action="store_true", default=False, help="Disable motion blur in renderer.")
+parser.add_argument("--action_noise_std", type=float, default=0.0,
+                    help="Std of Gaussian noise added to actions before env.step (mean=0).")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--out", type=str, default="/tmp/eval_results.txt", help="File to write results to.")
 # Success rate: fraction of episodes where object came within --success_threshold metres of goal.
@@ -153,6 +155,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
                 actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
             else:
                 actions = outputs[-1].get("mean_actions", outputs[0])
+            if args_cli.action_noise_std > 0.0:
+                if isinstance(actions, dict):
+                    actions = {k: v + torch.randn_like(v) * args_cli.action_noise_std
+                               for k, v in actions.items()}
+                else:
+                    actions = actions + torch.randn_like(actions) * args_cli.action_noise_std
             obs, rewards, terminated, truncated, _ = env.step(actions)
             states = env.state()
 

@@ -39,7 +39,7 @@ conda run -n isaaclab bash "$ISAACLAB_ROOT/isaaclab.sh" \
   --num_envs $NUM_ENVS \
   --num_episodes $NUM_EPISODES \
   --headless \
-  --out /tmp/cart_noise_sweep.txt
+  --out "$ISAACLAB_ROOT/results/cart_noise_sweep.txt"
 
 # --- Task 2: Shadow Hand Over ---
 echo ""
@@ -57,7 +57,7 @@ conda run -n isaaclab bash "$ISAACLAB_ROOT/isaaclab.sh" \
   --reward_scale 2.0 \
   --dist_reward_scale 20.0 \
   --headless \
-  --out /tmp/shadow_noise_sweep.txt
+  --out "$ISAACLAB_ROOT/results/shadow_noise_sweep.txt"
 
 # --- Combined summary ---
 echo ""
@@ -66,8 +66,8 @@ echo "  RESULTS"
 echo "============================================================"
 echo ""
 echo "=== Cart Double Pendulum ==="
-cat /tmp/cart_noise_sweep.txt
+cat "$ISAACLAB_ROOT/results/cart_noise_sweep.txt"
 
 echo ""
 echo "=== Shadow Hand Over ==="
-cat /tmp/shadow_noise_sweep.txt
+cat "$ISAACLAB_ROOT/results/shadow_noise_sweep.txt"
