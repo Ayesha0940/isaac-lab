@@ -207,3 +207,103 @@ rew = 2 · exp(−20 · goal_dist)
 <video controls width="800" src="logs/skrl/shadow_hand_over/2026-06-22_22-34-50_mappo_convergence_torch/videos/angle_diagonal/rl-video-step-0.mp4">
   <a href="logs/skrl/shadow_hand_over/2026-06-22_22-34-50_mappo_convergence_torch/videos/angle_diagonal/rl-video-step-0.mp4">Download diagonal view video</a>
 </video>
+
+---
+
+## 3. Action Noise Robustness
+
+To stress-test policy robustness, zero-mean Gaussian noise is injected into the **policy action outputs** before they are passed to the environment, simulating actuator noise or control disturbances at deployment time.
+
+### Noise Injection Mechanism
+
+```
+policy_output  →  + N(0, σ²)  →  env.step(noisy_action)
+```
+
+- Noise is applied **after** the policy's deterministic mean action is computed (`mean_actions`) and **before** `env.step()` is called.
+- The same `σ` (noise std) is applied independently to every action dimension of every agent at every timestep.
+- No manual clipping is applied — the environment handles it:
+  - **Cart Double Pendulum**: actions are unbounded; noise passes through directly and is scaled by the physical constants (×100 N / ×50 Nm).
+  - **Shadow Hand Over**: actions are scaled from `[−1, 1]` to joint limits via `scale()`, then hard-clipped to physical joint ranges via `saturate()`. This means extreme noise (`σ > 1`) is partially absorbed by joint-limit saturation.
+
+The noise std `σ` is in the **normalized policy output space** (same units as the network's output, typically `~[−1, 1]` at convergence).
+
+---
+
+### Results: Cart Double Pendulum
+
+**Success metric:** full-episode rate — fraction of 200 episodes where the cart/pendulum never fell (reached max episode length without early termination).
+
+| noise σ | reward mean ± std | full-episode rate |
+|---------|-------------------|-------------------|
+| 0.00 | 294.47 ± 4.29 | 100.0% |
+| 1.00 | 259.11 ± 4.98 | 100.0% |
+| 2.00 | 215.51 ± 27.59 | 99.5% |
+| **5.00** | **−15.31 ± 84.32** | **70.5%** |
+| 10.00 | −87.55 ± 87.73 | 1.0% |
+| 20.00 | −46.91 ± 41.02 | 0.5% |
+
+**Key observations:**
+
+- The policy is highly robust up to `σ = 2` — essentially zero degradation in episode completion despite a 27% reward drop.
+- There is a sharp failure cliff between `σ = 2` and `σ = 5`. At `σ = 5`, noise std already exceeds the typical policy output magnitude (~1), making the applied force/torque largely random.
+- At `σ ≥ 10`, the policy almost always fails immediately — the noise-induced forces (~1000 N random perturbation vs. ~100 N control signal) overwhelm the system.
+- The negative mean reward at high noise arises from the termination penalty (−2 per episode) outweighing the alive bonus.
+
+**Noise videos (front view):**
+
+<video controls width="800" src="logs/skrl/cart_double_pendulum_direct/videos/noise_std_5/rl-video-step-0.mp4">
+  <a href="logs/skrl/cart_double_pendulum_direct/videos/noise_std_5/rl-video-step-0.mp4">Download σ=5 video</a>
+</video>
+
+<video controls width="800" src="logs/skrl/cart_double_pendulum_direct/videos/noise_std_20/rl-video-step-0.mp4">
+  <a href="logs/skrl/cart_double_pendulum_direct/videos/noise_std_20/rl-video-step-0.mp4">Download σ=20 video</a>
+</video>
+
+---
+
+### Results: Shadow Hand Over
+
+**Success metric:** success rate — fraction of 200 episodes where the object came within **5 cm** of the goal at any timestep. Success is inferred from the instantaneous reward via `dist = −ln(r / 2) / 20`.
+
+| noise σ | reward mean ± std | success rate (< 5 cm) |
+|---------|-------------------|----------------------|
+| 0.00 | 842.14 ± 2.07 | 100.0% |
+| 1.00 | 814.35 ± 57.31 | 99.5% |
+| 2.00 | 775.79 ± 104.34 | 99.5% |
+| 5.00 | 549.84 ± 306.12 | 86.0% |
+| **10.00** | **285.01 ± 310.44** | **66.5%** |
+| 20.00 | 77.67 ± 161.77 | 51.0% |
+| 30.00 | 47.26 ± 97.67 | 32.0% |
+
+**Key observations:**
+
+- Shadow Hand is **substantially more robust** than Cart Double Pendulum. At `σ = 5` it still achieves 86% success, vs. only 70.5% full-episode rate for Cart.
+- The robustness comes from two sources: (1) **heavy domain randomization** during training (gravity, joint stiffness, friction, mass randomized every episode) forces the policy to learn noise-tolerant behaviors; (2) **joint-limit saturation** in the environment clips extreme noise values, attenuating the effective disturbance.
+- Degradation is gradual rather than cliff-like — the policy partially compensates even under large noise by leveraging redundancy in the 20-DOF hands.
+- At `σ = 30`, success rate falls to 32% and mean reward to 47/900. The policy still occasionally completes the task but can no longer reliably do so.
+- The large reward standard deviation at high noise (e.g., ±310 at `σ = 10`) reflects a bimodal outcome distribution: some episodes succeed fully while others fail completely, rather than all episodes degrading uniformly.
+
+**Noise videos (front view):**
+
+<video controls width="800" src="logs/skrl/shadow_hand_over/videos/noise_std_10/rl-video-step-0.mp4">
+  <a href="logs/skrl/shadow_hand_over/videos/noise_std_10/rl-video-step-0.mp4">Download σ=10 video</a>
+</video>
+
+<video controls width="800" src="logs/skrl/shadow_hand_over/videos/noise_std_30/rl-video-step-0.mp4">
+  <a href="logs/skrl/shadow_hand_over/videos/noise_std_30/rl-video-step-0.mp4">Download σ=30 video</a>
+</video>
+
+---
+
+### Summary Comparison
+
+| | Cart Double Pendulum | Shadow Hand Over |
+|---|---|---|
+| Robust up to σ ≈ | **2** | **5** |
+| 50% success at σ ≈ | 4–5 | 20 |
+| Failure mode | Sharp cliff (brittle balance task) | Gradual degradation (redundant DOFs) |
+| Source of robustness | None (no domain rand.) | Joint saturation + domain randomization |
+| Noise absorption | Direct (unbounded actions) | Partial (saturate() clips to joint limits) |
+
+Raw results: [results/cart_noise_sweep_wide.txt](results/cart_noise_sweep_wide.txt) · [results/shadow_noise_sweep_wide.txt](results/shadow_noise_sweep_wide.txt)
