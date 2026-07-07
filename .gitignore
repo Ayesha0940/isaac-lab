@@ -42,6 +42,7 @@ docker/.container.cfg
 **/.neptune/*
 docker/artifacts/
 *.tmp
+results/diffusion_data_shadow.npz
 
 # Doc Outputs
 **/docs/_build/*

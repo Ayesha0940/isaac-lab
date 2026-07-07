@@ -24,6 +24,13 @@ parser.add_argument(
     default=[0.0, 0.5, 1.0, 1.5, 2.0],
     help="List of Gaussian noise std values to sweep over (applied to actions before env.step).",
 )
+parser.add_argument(
+    "--noise_means",
+    type=float,
+    nargs="+",
+    default=[0.0],
+    help="List of Gaussian noise mean (bias) values to sweep over.",
+)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--out", type=str, default="/tmp/noise_sweep_results.txt", help="Output file path.")
 # Success rate via reward inversion: reward = reward_scale * exp(-dist_reward_scale * dist)
@@ -99,91 +106,94 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     reward_scale = args_cli.reward_scale
     dist_reward_scale = args_cli.dist_reward_scale
     noise_stds = args_cli.noise_stds
+    noise_means = args_cli.noise_means
 
     is_marl = hasattr(env, "possible_agents")
 
     # --- noise sweep ---
-    sweep_results = []  # list of (noise_std, mean_reward, std_reward, metric_value)
+    sweep_results = []  # list of (noise_mean, noise_std, mean_reward, std_reward, metric_value)
 
-    for noise_std in noise_stds:
-        print(f"[INFO] Evaluating noise_std={noise_std:.2f} ...")
+    for noise_mean in noise_means:
+        for noise_std in noise_stds:
+            print(f"[INFO] Evaluating noise_mean={noise_mean:.2f}, noise_std={noise_std:.2f} ...")
 
-        obs, _ = env.reset()
-        states = env.state() if is_marl else None
+            obs, _ = env.reset()
+            states = env.state() if is_marl else None
 
-        ep_reward_buf = np.zeros(num_envs, dtype=np.float64)
-        ep_length_buf = np.zeros(num_envs, dtype=np.int32)
-        ep_min_dist_buf = np.full(num_envs, np.inf, dtype=np.float64)
+            ep_reward_buf = np.zeros(num_envs, dtype=np.float64)
+            ep_length_buf = np.zeros(num_envs, dtype=np.int32)
+            ep_min_dist_buf = np.full(num_envs, np.inf, dtype=np.float64)
 
-        episode_rewards = []
-        episode_lengths = []
-        episode_successes = []
+            episode_rewards = []
+            episode_lengths = []
+            episode_successes = []
 
-        while len(episode_rewards) < target_episodes:
-            with torch.inference_mode():
-                outputs = runner.agent.act(obs, states, timestep=0, timesteps=0)
-                if is_marl:
-                    actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a])
-                               for a in env.possible_agents}
-                    if noise_std > 0.0:
-                        actions = {k: v + torch.randn_like(v) * noise_std
-                                   for k, v in actions.items()}
+            while len(episode_rewards) < target_episodes:
+                with torch.inference_mode():
+                    outputs = runner.agent.act(obs, states, timestep=0, timesteps=0)
+                    if is_marl:
+                        actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a])
+                                   for a in env.possible_agents}
+                        if noise_std > 0.0 or noise_mean != 0.0:
+                            actions = {k: v + torch.randn_like(v) * noise_std + noise_mean
+                                       for k, v in actions.items()}
+                    else:
+                        actions = outputs[-1].get("mean_actions", outputs[0])
+                        if noise_std > 0.0 or noise_mean != 0.0:
+                            actions = actions + torch.randn_like(actions) * noise_std + noise_mean
+
+                    obs, rewards, terminated, truncated, _ = env.step(actions)
+                    if is_marl:
+                        states = env.state()
+
+                if isinstance(rewards, dict):
+                    n_agents = len(rewards)
+                    r_np = sum(v.squeeze(-1).cpu().numpy() for v in rewards.values()) / n_agents
                 else:
-                    actions = outputs[-1].get("mean_actions", outputs[0])
-                    if noise_std > 0.0:
-                        actions = actions + torch.randn_like(actions) * noise_std
+                    r_np = rewards.squeeze(-1).cpu().numpy()
 
-                obs, rewards, terminated, truncated, _ = env.step(actions)
-                if is_marl:
-                    states = env.state()
+                if isinstance(terminated, dict):
+                    done_np = np.logical_or(
+                        sum(v.squeeze(-1).cpu().numpy() for v in terminated.values()) > 0,
+                        sum(v.squeeze(-1).cpu().numpy() for v in truncated.values()) > 0,
+                    )
+                else:
+                    done_np = np.logical_or(
+                        terminated.squeeze(-1).cpu().numpy(),
+                        truncated.squeeze(-1).cpu().numpy(),
+                    )
 
-            if isinstance(rewards, dict):
-                n_agents = len(rewards)
-                r_np = sum(v.squeeze(-1).cpu().numpy() for v in rewards.values()) / n_agents
-            else:
-                r_np = rewards.squeeze(-1).cpu().numpy()
+                ep_reward_buf += r_np
+                ep_length_buf += 1
 
-            if isinstance(terminated, dict):
-                done_np = np.logical_or(
-                    sum(v.squeeze(-1).cpu().numpy() for v in terminated.values()) > 0,
-                    sum(v.squeeze(-1).cpu().numpy() for v in truncated.values()) > 0,
-                )
-            else:
-                done_np = np.logical_or(
-                    terminated.squeeze(-1).cpu().numpy(),
-                    truncated.squeeze(-1).cpu().numpy(),
-                )
+                if track_success:
+                    safe_r = np.clip(r_np / reward_scale, 1e-8, 1.0)
+                    step_dist = -np.log(safe_r) / dist_reward_scale
+                    ep_min_dist_buf = np.minimum(ep_min_dist_buf, step_dist)
 
-            ep_reward_buf += r_np
-            ep_length_buf += 1
+                for i in range(num_envs):
+                    if done_np[i] and len(episode_rewards) < target_episodes:
+                        episode_rewards.append(float(ep_reward_buf[i]))
+                        episode_lengths.append(int(ep_length_buf[i]))
+                        if track_success:
+                            episode_successes.append(bool(ep_min_dist_buf[i] < success_threshold))
+                        ep_reward_buf[i] = 0.0
+                        ep_length_buf[i] = 0
+                        ep_min_dist_buf[i] = np.inf
+
+            rewards_arr = np.array(episode_rewards)
+            lengths_arr = np.array(episode_lengths)
+            max_len = int(lengths_arr.max()) if len(lengths_arr) else 1
 
             if track_success:
-                safe_r = np.clip(r_np / reward_scale, 1e-8, 1.0)
-                step_dist = -np.log(safe_r) / dist_reward_scale
-                ep_min_dist_buf = np.minimum(ep_min_dist_buf, step_dist)
+                metric = np.mean(episode_successes) * 100.0
+            else:
+                metric = (lengths_arr >= max_len).mean() * 100.0
 
-            for i in range(num_envs):
-                if done_np[i] and len(episode_rewards) < target_episodes:
-                    episode_rewards.append(float(ep_reward_buf[i]))
-                    episode_lengths.append(int(ep_length_buf[i]))
-                    if track_success:
-                        episode_successes.append(bool(ep_min_dist_buf[i] < success_threshold))
-                    ep_reward_buf[i] = 0.0
-                    ep_length_buf[i] = 0
-                    ep_min_dist_buf[i] = np.inf
-
-        rewards_arr = np.array(episode_rewards)
-        lengths_arr = np.array(episode_lengths)
-        max_len = int(lengths_arr.max()) if len(lengths_arr) else 1
-
-        if track_success:
-            metric = np.mean(episode_successes) * 100.0
-        else:
-            metric = (lengths_arr >= max_len).mean() * 100.0
-
-        sweep_results.append((noise_std, rewards_arr.mean(), rewards_arr.std(), metric))
-        print(f"  noise_std={noise_std:.2f}: reward={rewards_arr.mean():.2f}±{rewards_arr.std():.2f}  "
-              f"{'success' if track_success else 'full-ep'}_rate={metric:.1f}%")
+            sweep_results.append((noise_mean, noise_std, rewards_arr.mean(), rewards_arr.std(), metric))
+            print(f"  noise_mean={noise_mean:.2f}, noise_std={noise_std:.2f}: "
+                  f"reward={rewards_arr.mean():.2f}±{rewards_arr.std():.2f}  "
+                  f"{'success' if track_success else 'full-ep'}_rate={metric:.1f}%")
 
     env.close()
 
@@ -193,17 +203,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     lines = [
         "",
-        "=" * 68,
+        "=" * 80,
         f"  Noise Robustness Sweep — {args_cli.task}",
-        f"  {target_episodes} episodes × {num_envs} envs per noise level",
+        f"  {target_episodes} episodes × {num_envs} envs per (noise_mean, noise_std) pair",
         f"  Noise injected in policy output space (before env.step)",
-        "=" * 68,
-        f"  {'noise_std':<10} | {'reward mean ± std':<22} | {metric_label}",
-        f"  {'-'*10}-+-{'-'*22}-+-{'-'*12}",
+        "=" * 80,
+        f"  {'noise_mean':<11} | {'noise_std':<10} | {'reward mean ± std':<22} | {metric_label}",
+        f"  {'-'*11}-+-{'-'*10}-+-{'-'*22}-+-{'-'*12}",
     ]
-    for noise_std, mean_r, std_r, metric in sweep_results:
-        lines.append(f"  {noise_std:<10.2f} | {mean_r:>8.2f} ± {std_r:<11.2f} | {metric:>6.1f}%")
-    lines.append("=" * 68)
+    for noise_mean, noise_std, mean_r, std_r, metric in sweep_results:
+        lines.append(f"  {noise_mean:<11.2f} | {noise_std:<10.2f} | {mean_r:>8.2f} ± {std_r:<11.2f} | {metric:>6.1f}%")
+    lines.append("=" * 80)
     lines.append(f"  ({header_label})")
     lines.append("")
 
