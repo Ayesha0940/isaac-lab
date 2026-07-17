@@ -27,6 +27,10 @@ parser.add_argument("--video_dir", type=str, default=None, help="Override video 
 parser.add_argument("--no_motion_blur", action="store_true", default=False, help="Disable motion blur in renderer.")
 parser.add_argument("--action_noise_std", type=float, default=0.0,
                     help="Std of Gaussian noise added to actions before env.step (mean=0).")
+parser.add_argument("--stochastic", action="store_true", default=False,
+                    help="Use stochastic sampled actions instead of the deterministic policy mean. "
+                         "Useful to check whether a policy's reported training reward (computed on "
+                         "stochastic samples) is reproducible under its own deterministic mean action.")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--out", type=str, default="/tmp/eval_results.txt", help="File to write results to.")
 # Success rate: fraction of episodes where object came within --success_threshold metres of goal.
@@ -152,9 +156,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         with torch.inference_mode():
             outputs = runner.agent.act(obs, states, timestep=0, timesteps=0)
             if hasattr(env, "possible_agents"):
-                actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
+                if args_cli.stochastic:
+                    actions = {a: outputs[0][a] for a in env.possible_agents}
+                else:
+                    actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
             else:
-                actions = outputs[-1].get("mean_actions", outputs[0])
+                actions = outputs[0] if args_cli.stochastic else outputs[-1].get("mean_actions", outputs[0])
             if args_cli.action_noise_std > 0.0:
                 if isinstance(actions, dict):
                     actions = {k: v + torch.randn_like(v) * args_cli.action_noise_std
