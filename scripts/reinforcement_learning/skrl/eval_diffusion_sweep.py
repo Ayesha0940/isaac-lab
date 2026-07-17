@@ -39,6 +39,21 @@ parser.add_argument(
     "--t_start_list", type=int, nargs="+", default=[20, 40, 60],
     help="Reverse-diffusion start timesteps to evaluate. Larger = more denoising.",
 )
+parser.add_argument(
+    "--attack_kind", type=str, default="gaussian", choices=["gaussian", "stuck_at", "delay"],
+    help=(
+        "Eval-time action attack to sweep: additive Gaussian noise, per-dim stuck-at actuator "
+        "fault, or k-step action-delay fault."
+    ),
+)
+parser.add_argument(
+    "--sp_probs", type=float, nargs="+", default=[0.0, 0.1, 0.25, 0.5, 0.75, 1.0],
+    help="Per-dimension stuck probabilities to sweep over when --attack_kind stuck_at.",
+)
+parser.add_argument(
+    "--delay_ks", type=int, nargs="+", default=[0, 1, 2, 3, 5, 8],
+    help="Action-delay step counts to sweep over when --attack_kind delay.",
+)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--out", type=str, default="/tmp/diffusion_sweep_results.txt")
 parser.add_argument("--success_threshold", type=float, default=None, help="Goal distance (m) for success metric.")
@@ -78,6 +93,84 @@ import isaaclab_tasks  # noqa: F401
 
 algorithm = args_cli.algorithm.lower()
 agent_cfg_entry_point = args_cli.agent if args_cli.agent else f"skrl_{algorithm}_cfg_entry_point"
+
+
+class StuckAtState:
+    """Per-env, per-agent 'stuck-at' actuator fault, vectorized over num_envs.
+
+    Each action dimension independently freezes (w.p. sp_prob) at the first
+    action value computed after that env's episode starts. Frozen dims replay
+    that value every step until the env's episode ends; non-frozen dims pass
+    the policy's current action through unchanged. A fresh mask/frozen-value
+    is (re-)sampled per env whenever that env starts a new episode.
+    """
+
+    def __init__(self, sp_prob: float, num_envs: int):
+        self.sp_prob = sp_prob
+        self.needs_init = np.ones(num_envs, dtype=bool)  # per-env, shared across agents
+        self._mask = {}  # agent -> (num_envs, dim) bool
+        self._val = {}  # agent -> (num_envs, dim)
+
+    def apply(self, agent: str, action: torch.Tensor) -> torch.Tensor:
+        if agent not in self._mask:
+            self._mask[agent] = torch.zeros_like(action, dtype=torch.bool)
+            self._val[agent] = torch.zeros_like(action)
+        mask, val = self._mask[agent], self._val[agent]
+
+        init_idx_np = np.nonzero(self.needs_init)[0]
+        if init_idx_np.size:
+            init_idx = torch.as_tensor(init_idx_np, device=action.device, dtype=torch.long)
+            mask[init_idx] = torch.rand((init_idx.numel(), action.shape[-1]), device=action.device) < self.sp_prob
+            val[init_idx] = action[init_idx]
+
+        return torch.where(mask, val, action)
+
+    def after_step(self):
+        """Call once per step, after apply() has run for every agent."""
+        self.needs_init[:] = False
+
+    def on_episode_end(self, done_np: np.ndarray):
+        """Call once per step, right after done_np is computed."""
+        self.needs_init |= done_np
+
+
+class DelayState:
+    """Per-env, per-agent action-delay fault, vectorized over num_envs.
+
+    Each executed action is the policy's action from delay_k steps ago (an
+    actuation/communication delay), padded with the episode's first action
+    until delay_k steps have elapsed. Implemented via a fixed-size per-agent
+    ring buffer of length delay_k+1 (only that many past actions are ever
+    needed).
+    """
+
+    def __init__(self, delay_k: int, num_envs: int):
+        self.delay_k = delay_k
+        self.n_slots = delay_k + 1
+        self.t = np.zeros(num_envs, dtype=np.int64)  # steps since this env's episode reset
+        self._buf = {}  # agent -> (num_envs, n_slots, dim)
+
+    def apply(self, agent: str, action: torch.Tensor) -> torch.Tensor:
+        if agent not in self._buf:
+            self._buf[agent] = torch.zeros(
+                action.shape[0], self.n_slots, action.shape[-1], device=action.device, dtype=action.dtype
+            )
+        buf = self._buf[agent]
+        env_idx = torch.arange(action.shape[0], device=action.device)
+        t = torch.as_tensor(self.t, device=action.device, dtype=torch.long)
+
+        buf[env_idx, t % self.n_slots] = action  # append current action
+
+        read_slot = torch.where(t >= self.delay_k, (t - self.delay_k) % self.n_slots, torch.zeros_like(t))
+        return buf[env_idx, read_slot]
+
+    def after_step(self):
+        """Call once per step, after apply() has run for every agent."""
+        self.t += 1
+
+    def on_episode_end(self, done_np: np.ndarray):
+        """Call once per step, right after done_np is computed."""
+        self.t[done_np] = 0
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +294,11 @@ def run_one_sweep(
     is_marl: bool,
     num_envs: int,
     target_episodes: int,
+    attack_kind: str,
     noise_std: float,
     noise_mean: float,
+    sp_prob: float,
+    delay_k: int,
     denoiser_model: Optional[ActionDenoiser],
     denoiser_consts: Optional[dict],
     t_start: int,
@@ -216,6 +312,16 @@ def run_one_sweep(
 
     obs, _ = env.reset()
     states = env.state() if is_marl else None
+
+    if attack_kind == "gaussian":
+        attack_active = noise_std > 0.0 or noise_mean != 0.0
+        attack_state = None
+    elif attack_kind == "stuck_at":
+        attack_active = sp_prob > 0.0
+        attack_state = StuckAtState(sp_prob, num_envs)
+    else:  # delay
+        attack_active = delay_k > 0
+        attack_state = DelayState(delay_k, num_envs)
 
     ep_reward_buf = np.zeros(num_envs, dtype=np.float64)
     ep_length_buf = np.zeros(num_envs, dtype=np.int32)
@@ -233,15 +339,22 @@ def run_one_sweep(
             else:
                 actions = outputs[-1].get("mean_actions", outputs[0])
 
-            # --- Add adversarial noise ---
-            if noise_std > 0.0 or noise_mean != 0.0:
+            # --- Apply action attack ---
+            if attack_kind == "gaussian":
+                if attack_active:
+                    if is_marl:
+                        actions = {k: v + torch.randn_like(v) * noise_std + noise_mean for k, v in actions.items()}
+                    else:
+                        actions = actions + torch.randn_like(actions) * noise_std + noise_mean
+            else:  # stuck_at, delay
                 if is_marl:
-                    actions = {k: v + torch.randn_like(v) * noise_std + noise_mean for k, v in actions.items()}
+                    actions = {k: attack_state.apply(k, v) for k, v in actions.items()}
                 else:
-                    actions = actions + torch.randn_like(actions) * noise_std + noise_mean
+                    actions = attack_state.apply("_single", actions)
+                attack_state.after_step()
 
             # --- Diffusion denoising ---
-            if denoiser_model is not None and (noise_std > 0.0 or noise_mean != 0.0):
+            if denoiser_model is not None and attack_active:
                 if is_marl:
                     action_vec = torch.cat([actions[a] for a in agent_order], dim=-1)  # [B, Da]
                     # env.state() may return a dict — concatenate to flat tensor
@@ -282,6 +395,9 @@ def run_one_sweep(
             )
         else:
             done_np = np.logical_or(terminated.squeeze(-1).cpu().numpy(), truncated.squeeze(-1).cpu().numpy())
+
+        if attack_state is not None:
+            attack_state.on_episode_end(done_np)
 
         ep_reward_buf += r_np
         ep_length_buf += 1
@@ -371,45 +487,67 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     dist_reward_scale = args_cli.dist_reward_scale
     noise_stds = args_cli.noise_stds
     noise_means = args_cli.noise_means
+    sp_probs = args_cli.sp_probs
+    delay_ks = args_cli.delay_ks
     t_start_list = args_cli.t_start_list
     target_episodes = args_cli.num_episodes
+    attack_kind = args_cli.attack_kind
 
-    # Results: list of rows keyed by (noise_mean, noise_std)
+    # Single-scalar-param attacks (stuck_at, delay) share one sweep-point/row shape.
+    SINGLE_PARAM_ATTACKS = {"stuck_at": "sp_prob", "delay": "delay_k"}
+
+    # Results: list of rows keyed by (noise_mean, noise_std), or by the single attack param.
     results = []
 
-    for noise_mean in noise_means:
-        for noise_std in noise_stds:
-            row = {"noise_mean": noise_mean, "noise_std": noise_std}
-            print(f"\n[INFO] noise_mean={noise_mean:.2f}, noise_std={noise_std:.2f}")
+    if attack_kind == "gaussian":
+        sweep_points = [{"noise_mean": nm, "noise_std": ns} for nm in noise_means for ns in noise_stds]
+    else:
+        param_name = SINGLE_PARAM_ATTACKS[attack_kind]
+        param_values = sp_probs if attack_kind == "stuck_at" else delay_ks
+        sweep_points = [{param_name: v} for v in param_values]
 
-            # Baseline: no denoiser
-            print(f"  Evaluating without denoiser ...")
+    for point in sweep_points:
+        noise_mean = point.get("noise_mean", 0.0)
+        noise_std = point.get("noise_std", 0.0)
+        sp_prob = point.get("sp_prob", 0.0)
+        delay_k = point.get("delay_k", 0)
+        row = dict(point)
+        if attack_kind == "gaussian":
+            point_label = f"noise_mean={noise_mean:.2f}, noise_std={noise_std:.2f}"
+        else:
+            param_name = SINGLE_PARAM_ATTACKS[attack_kind]
+            point_label = f"{param_name}={point[param_name]}"
+        print(f"\n[INFO] {point_label}")
+
+        # Baseline: no denoiser
+        print(f"  Evaluating without denoiser ...")
+        mean_r, std_r, metric = run_one_sweep(
+            env=env, runner=runner, agent_order=agent_order, per_agent_dims=per_agent_dims,
+            is_marl=is_marl, num_envs=num_envs, target_episodes=target_episodes,
+            attack_kind=attack_kind, noise_std=noise_std, noise_mean=noise_mean, sp_prob=sp_prob,
+            delay_k=delay_k, denoiser_model=None, denoiser_consts=None, t_start=0, device=device,
+            track_success=track_success, success_threshold=success_threshold,
+            reward_scale=reward_scale, dist_reward_scale=dist_reward_scale,
+        )
+        row["no_denoise"] = (mean_r, std_r, metric)
+        print(f"    no_denoise: reward={mean_r:.2f}±{std_r:.2f}  metric={metric:.1f}%")
+
+        # With denoiser at each t_start
+        for t_start in t_start_list:
+            print(f"  Evaluating with denoiser t_start={t_start} ...")
             mean_r, std_r, metric = run_one_sweep(
                 env=env, runner=runner, agent_order=agent_order, per_agent_dims=per_agent_dims,
                 is_marl=is_marl, num_envs=num_envs, target_episodes=target_episodes,
-                noise_std=noise_std, noise_mean=noise_mean, denoiser_model=None,
-                denoiser_consts=None, t_start=0, device=device, track_success=track_success,
+                attack_kind=attack_kind, noise_std=noise_std, noise_mean=noise_mean, sp_prob=sp_prob,
+                delay_k=delay_k, denoiser_model=denoiser_model, denoiser_consts=denoiser_consts,
+                t_start=t_start, device=device, track_success=track_success,
                 success_threshold=success_threshold, reward_scale=reward_scale,
                 dist_reward_scale=dist_reward_scale,
             )
-            row["no_denoise"] = (mean_r, std_r, metric)
-            print(f"    no_denoise: reward={mean_r:.2f}±{std_r:.2f}  metric={metric:.1f}%")
+            row[f"t{t_start}"] = (mean_r, std_r, metric)
+            print(f"    t_start={t_start}: reward={mean_r:.2f}±{std_r:.2f}  metric={metric:.1f}%")
 
-            # With denoiser at each t_start
-            for t_start in t_start_list:
-                print(f"  Evaluating with denoiser t_start={t_start} ...")
-                mean_r, std_r, metric = run_one_sweep(
-                    env=env, runner=runner, agent_order=agent_order, per_agent_dims=per_agent_dims,
-                    is_marl=is_marl, num_envs=num_envs, target_episodes=target_episodes,
-                    noise_std=noise_std, noise_mean=noise_mean, denoiser_model=denoiser_model,
-                    denoiser_consts=denoiser_consts, t_start=t_start, device=device,
-                    track_success=track_success, success_threshold=success_threshold,
-                    reward_scale=reward_scale, dist_reward_scale=dist_reward_scale,
-                )
-                row[f"t{t_start}"] = (mean_r, std_r, metric)
-                print(f"    t_start={t_start}: reward={mean_r:.2f}±{std_r:.2f}  metric={metric:.1f}%")
-
-            results.append(row)
+        results.append(row)
 
     env.close()
 
@@ -418,17 +556,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     t_start_cols = [f"t{t}" for t in t_start_list]
 
     col_w = 22
-    header_parts = [f"{'noise_mean':<11}", f"{'noise_std':<10}"]
+    if attack_kind == "gaussian":
+        header_parts = [f"{'noise_mean':<11}", f"{'noise_std':<10}"]
+    else:
+        header_parts = [f"{SINGLE_PARAM_ATTACKS[attack_kind]:<10}"]
     header_parts += [f"{'no_denoise':<{col_w}}"]
     for t in t_start_list:
         header_parts += [f"{'denoiser_t'+str(t):<{col_w}}"]
     header_line = " | ".join(header_parts)
     sep_line = "-" * len(header_line)
 
+    ATTACK_TITLES = {
+        "gaussian": "Diffusion Denoiser Sweep",
+        "stuck_at": "Diffusion Denoiser Sweep — Stuck-At Actuator Fault",
+        "delay": "Diffusion Denoiser Sweep — Action-Delay Fault",
+    }
+    title = ATTACK_TITLES[attack_kind]
     lines = [
         "",
         "=" * len(header_line),
-        f"  Diffusion Denoiser Sweep — {args_cli.task}",
+        f"  {title} — {args_cli.task}",
         f"  {target_episodes} episodes × {num_envs} envs per configuration",
         f"  Metric: {metric_label} ({'< '+str(success_threshold)+' m' if track_success else 'reaches max len'})",
         "=" * len(header_line),
@@ -439,9 +586,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     ]
 
     for row in results:
-        nm = row["noise_mean"]
-        ns = row["noise_std"]
-        parts = [f"{nm:<11.2f}", f"{ns:<10.2f}"]
+        if attack_kind == "gaussian":
+            parts = [f"{row['noise_mean']:<11.2f}", f"{row['noise_std']:<10.2f}"]
+        else:
+            parts = [f"{row[SINGLE_PARAM_ATTACKS[attack_kind]]:<10.2f}"]
         for col in ["no_denoise"] + t_start_cols:
             mean_r, std_r, metric = row[col]
             cell = f"{mean_r:>6.2f}±{std_r:<5.2f} [{metric:>5.1f}%]"

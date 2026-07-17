@@ -4,26 +4,46 @@ import matplotlib.lines as mlines
 
 STDS = [0.0, 1.0, 2.0, 5.0, 10.0]
 MUS = [-1.0, 0.0, 1.0]
+FAULT_XVALS = [0.0, 0.10, 0.25, 0.50, 0.75, 1.00]
+DELAY_XVALS = [0.0, 1.0, 2.0, 3.0, 5.0, 8.0]
 
-ALGOS = [
-    ("MAPPO", "results/noise_mu_sweeps/cart/mappo_diffusion_noise_mean_cart.txt", "#2a78d6"),
-    ("IPPO", "results/noise_mu_sweeps/cart/ippo_tuned_diffusion_noise_mean_cart.txt", "#008300"),
-    ("Adv-MAPPO", "results/noise_mu_sweeps/cart/mappo_act_adv_eps1_diffusion_noise_mean_cart.txt", "#4a3aa7"),
-]
+ALGOS = ["MAPPO", "IPPO", "Adv-MAPPO"]
+COLORS = {"MAPPO": "#2a78d6", "IPPO": "#008300", "Adv-MAPPO": "#4a3aa7"}
 
-ROW_PAT = re.compile(
+NOISE_FILES = {
+    "MAPPO": "results/noise_mu_sweeps/cart/mappo_diffusion_noise_mean_cart.txt",
+    "IPPO": "results/noise_mu_sweeps/cart/ippo_tuned_diffusion_noise_mean_cart.txt",
+    "Adv-MAPPO": "results/noise_mu_sweeps/cart/mappo_act_adv_eps1_diffusion_noise_mean_cart.txt",
+}
+FAULT_FILES = {
+    "MAPPO": "results/Actuation_fault/cart/mappo_diffusion_stuck_at_sweep_cart.txt",
+    "IPPO": "results/Actuation_fault/cart/ippo_tuned_diffusion_stuck_at_sweep_cart.txt",
+    "Adv-MAPPO": "results/Actuation_fault/cart/mappo_act_adv_diffusion_stuck_at_sweep_cart.txt",
+}
+DELAY_FILES = {
+    "MAPPO": "results/delay_sweep/cart/mappo_diffusion_delay_sweep_cart.txt",
+    "IPPO": "results/delay_sweep/cart/ippo_tuned_diffusion_delay_sweep_cart.txt",
+    "Adv-MAPPO": "results/delay_sweep/cart/mappo_act_adv_diffusion_delay_sweep_cart.txt",
+}
+
+NOISE_ROW_PAT = re.compile(
     r"^\s*([-\d.]+)\s*\|\s*([\d.]+)\s*\|"
+    r"\s*(-?[\d.]+)±([\d.]+)\s*\[\s*[\d.]+%\]"
+    r"\s*\|\s*(-?[\d.]+)±([\d.]+)\s*\[\s*[\d.]+%\]"
+)
+FAULT_ROW_PAT = re.compile(
+    r"^\s*([\d.]+)\s*\|"
     r"\s*(-?[\d.]+)±([\d.]+)\s*\[\s*[\d.]+%\]"
     r"\s*\|\s*(-?[\d.]+)±([\d.]+)\s*\[\s*[\d.]+%\]"
 )
 
 
-def parse_file(path):
+def parse_noise_file(path):
     """Return dict (noise_mean, noise_std) -> dict(reward_no, std_no, reward_t20, std_t20)."""
     data = {}
     with open(path) as f:
         for line in f:
-            m = ROW_PAT.match(line)
+            m = NOISE_ROW_PAT.match(line)
             if m:
                 mu, std = float(m.group(1)), float(m.group(2))
                 data[(mu, std)] = {
@@ -35,15 +55,49 @@ def parse_file(path):
     return data
 
 
-algo_data = {name: parse_file(path) for name, path, _ in ALGOS}
+def parse_fault_file(path):
+    """Return dict sweep_val -> dict(reward_no, std_no, reward_t20, std_t20)."""
+    data = {}
+    with open(path) as f:
+        for line in f:
+            m = FAULT_ROW_PAT.match(line)
+            if m:
+                val = float(m.group(1))
+                data[val] = {
+                    "reward_no": float(m.group(2)),
+                    "std_no": float(m.group(3)),
+                    "reward_t20": float(m.group(4)),
+                    "std_t20": float(m.group(5)),
+                }
+    return data
 
-fig, axes = plt.subplots(1, len(MUS), figsize=(17, 5.5), sharey=True)
 
-for col, mu in enumerate(MUS):
+noise_data = {name: parse_noise_file(path) for name, path in NOISE_FILES.items()}
+fault_data = {name: parse_fault_file(path) for name, path in FAULT_FILES.items()}
+delay_data = {name: parse_fault_file(path) for name, path in DELAY_FILES.items()}
+
+panels = [
+    {"title": "Stuck-At Fault", "xlabel": "Stuck-at Probability", "xvals": FAULT_XVALS,
+     "data": fault_data},
+    {"title": "Action Delay", "xlabel": "Delay Steps", "xvals": DELAY_XVALS,
+     "data": delay_data},
+]
+for mu in MUS:
+    panels.append({
+        "title": f"noise μ = {mu:+.1f}",
+        "xlabel": "Action Noise Std",
+        "xvals": STDS,
+        "data": {name: {s: noise_data[name][(mu, s)] for s in STDS} for name in ALGOS},
+    })
+
+fig, axes = plt.subplots(1, len(panels), figsize=(23, 5.5), sharey=True)
+
+for col, panel in enumerate(panels):
     ax = axes[col]
 
-    for name, _, color in ALGOS:
-        cells = [algo_data[name][(mu, s)] for s in STDS]
+    for name in ALGOS:
+        color = COLORS[name]
+        cells = [panel["data"][name][x] for x in panel["xvals"]]
 
         mean_no = [c["reward_no"] for c in cells]
         std_no = [c["std_no"] for c in cells]
@@ -55,17 +109,17 @@ for col, mu in enumerate(MUS):
         lo_t20 = [m - s for m, s in zip(mean_t20, std_t20)]
         hi_t20 = [m + s for m, s in zip(mean_t20, std_t20)]
 
-        ax.fill_between(STDS, lo_no, hi_no, color=color, alpha=0.10, linewidth=0, zorder=1)
-        ax.fill_between(STDS, lo_t20, hi_t20, color=color, alpha=0.10, linewidth=0, zorder=1)
+        ax.fill_between(panel["xvals"], lo_no, hi_no, color=color, alpha=0.10, linewidth=0, zorder=1)
+        ax.fill_between(panel["xvals"], lo_t20, hi_t20, color=color, alpha=0.10, linewidth=0, zorder=1)
 
-        ax.plot(STDS, mean_no, "-", color=color, linewidth=2, marker="o", markersize=5, zorder=3)
-        ax.plot(STDS, mean_t20, ":", color=color, linewidth=2.2, marker="s", markersize=5, zorder=3)
+        ax.plot(panel["xvals"], mean_no, "-", color=color, linewidth=2, marker="o", markersize=5, zorder=3)
+        ax.plot(panel["xvals"], mean_t20, ":", color=color, linewidth=2.2, marker="s", markersize=5, zorder=3)
 
     ax.axhline(0, color="#c3c2b7", linewidth=1, zorder=0)
-    ax.set_xticks(STDS)
+    ax.set_xticks(panel["xvals"])
     ax.grid(True, alpha=0.25, zorder=0)
-    ax.set_title(f"noise μ = {mu:+.1f}", fontsize=11)
-    ax.set_xlabel("Action Noise Std", fontsize=9.5)
+    ax.set_title(panel["title"], fontsize=11)
+    ax.set_xlabel(panel["xlabel"], fontsize=9.5)
 
 axes[0].set_ylabel("Mean Reward", fontsize=10)
 
@@ -74,7 +128,7 @@ legend_handles = [
     mlines.Line2D([], [], color="#52514e", ls=":", marker="s", markersize=5, linewidth=2.2, label="Denoiser t=20 (mean ± std)"),
 ]
 color_handles = [
-    mlines.Line2D([], [], color=color, ls="-", linewidth=6, label=name) for name, _, color in ALGOS
+    mlines.Line2D([], [], color=COLORS[name], ls="-", linewidth=6, label=name) for name in ALGOS
 ]
 fig.legend(
     handles=color_handles + legend_handles,
@@ -82,7 +136,7 @@ fig.legend(
 )
 
 fig.suptitle(
-    "Cart Double Pendulum — Reward Mean ± Std across Noise Std\n"
+    "Cart Double Pendulum — Reward Mean ± Std across Fault Sweeps + Noise Std\n"
     "200 episodes × 64 envs | dotted = denoiser t_start=20, solid = no denoiser, shading = ±1 std",
     fontsize=13, y=1.03,
 )
